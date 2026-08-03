@@ -1,5 +1,6 @@
 package au.com.tyo.mq;
 
+import io.socket.client.Ack;
 import io.socket.client.IO;
 import io.socket.client.Socket;
 import org.json.JSONObject;
@@ -8,10 +9,13 @@ import java.net.URI;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 
 /**
@@ -136,6 +140,70 @@ public class MqSocket {
 
     public void emit(String event, JSONObject payload) {
         ensureSocket().emit(event, payload);
+    }
+
+    /**
+     * Emit {@code event} with {@code payload} and block until the server's
+     * Socket.IO acknowledgement callback fires, returning its first argument as
+     * a {@link JSONObject} (the broker replies via {@code callback({...})}).
+     *
+     * <p>This is the request/response counterpart of {@link #emit} — needed by
+     * the E2EE / sealed-sender command set (PREKEY_TAKE, SEALED_CERT_REQUEST,
+     * SEALED_DELIVER, ...), whose broker handlers all reply through the ack.
+     * The legacy {@link #emit} has no ack support, and the sealed core calls
+     * some of these synchronously, so a blocking, timeout-bounded call is
+     * required.
+     *
+     * <p>On timeout this throws (rather than returning {@code null}) so a caller
+     * never mistakes "no reply" for a valid one. A {@code null} return means the
+     * server acked with no/empty argument.
+     *
+     * @param timeoutMs how long to wait for the ack before giving up
+     * @throws TimeoutException     if no ack arrives within {@code timeoutMs}
+     * @throws InterruptedException if the waiting thread is interrupted
+     */
+    public JSONObject emitWithAck(String event, JSONObject payload, long timeoutMs)
+            throws TimeoutException, InterruptedException {
+        Socket s = ensureSocket();
+        // Capacity-1 queue: the ack fires on Socket.IO's own event thread while
+        // the caller blocks here on poll(). A SynchronousQueue would race (offer
+        // needs a waiting taker); ArrayBlockingQueue.offer never blocks/loses it.
+        final BlockingQueue<Object[]> box = new ArrayBlockingQueue<>(1);
+        s.emit(event, new Object[]{payload}, new Ack() {
+            @Override
+            public void call(Object... args) {
+                box.offer(args != null ? args : new Object[0]);
+            }
+        });
+
+        Object[] res = box.poll(timeoutMs, TimeUnit.MILLISECONDS);
+        if (res == null)
+            throw new TimeoutException("no ack for '" + event + "' within " + timeoutMs + "ms");
+        Object first = res.length > 0 ? res[0] : null;
+        if (first == null)
+            return null;
+        if (first instanceof JSONObject)
+            return (JSONObject) first;
+        // Defensive: a non-object ack (rare) is wrapped so the caller still gets
+        // a JSONObject and can inspect it, rather than a ClassCastException.
+        return new JSONObject().put("value", first);
+    }
+
+    /**
+     * Register a listener for a raw broker-pushed event that carries a single
+     * JSON payload — e.g. the sealed-sender {@code SEALED_MESSAGE} push. Public
+     * counterpart of the internal {@link #on}: it does NOT enrol the event in
+     * the CONSUME_CHUNK reassembly map (these events are not chunked), so it is
+     * safe for the E2EE/sealed listeners the secure-chat transport wires up.
+     * Registering again for the same event replaces the previous listener.
+     */
+    public void onEvent(String event, Consumer<JSONObject> handler) {
+        Socket s = ensureSocket();
+        s.off(event);
+        s.on(event, args -> {
+            if (args.length > 0 && args[0] instanceof JSONObject)
+                handler.accept((JSONObject) args[0]);
+        });
     }
 
     public void disconnect() {

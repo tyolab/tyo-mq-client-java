@@ -1,0 +1,34 @@
+// Gradle build for the tyo-mq Java client.
+//
+// The canonical build is Maven (pom.xml); this file exists so downstream Gradle
+// projects (e.g. secure-chat-android) can consume the client via a Gradle
+// composite build — `includeBuild '/path/to/tyo-mq-client-java'` — which
+// substitutes the `au.com.tyo:tyo-mq-client` dependency with this project's
+// output and pulls in its transitive deps (socket.io-client, org.json). Keep
+// the coordinates and dependency versions in sync with pom.xml.
+plugins {
+    id 'java-library'
+}
+
+group = 'au.com.tyo'
+version = '0.1.0'
+
+repositories {
+    mavenCentral()
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
+
+dependencies {
+    api 'io.socket:socket.io-client:2.1.2'
+    api 'org.json:json:20240303'
+
+    testImplementation 'junit:junit:4.13.2'
+}
+
+test {
+    useJUnit()
+}

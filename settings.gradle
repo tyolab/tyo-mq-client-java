@@ -1,0 +1,3 @@
+// Project name = the Maven artifactId, so a composite-build dependency
+// substitution for `au.com.tyo:tyo-mq-client` resolves to this build.
+rootProject.name = 'tyo-mq-client'
