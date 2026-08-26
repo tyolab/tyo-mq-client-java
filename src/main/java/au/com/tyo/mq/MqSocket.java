@@ -16,6 +16,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 /**
@@ -198,11 +199,37 @@ public class MqSocket {
      * Registering again for the same event replaces the previous listener.
      */
     public void onEvent(String event, Consumer<JSONObject> handler) {
+        onEventWithAck(event, (payload, ack) -> handler.accept(payload));
+    }
+
+    /**
+     * Like {@link #onEvent}, but also surfaces the SERVER-requested Socket.IO
+     * acknowledgement callback when one is present. Socket.IO's Java client
+     * delivers a server-requested ack as the LAST element of the listener's
+     * args array (an {@link Ack}); the handler answers it with
+     * {@code ack.call(responseJson)}.
+     *
+     * <p>The {@code ack} argument is {@code null} when the server did not
+     * request an acknowledgement for this emit (e.g. a live push or a
+     * legacy replay) — callers must null-check before answering. Needed by the
+     * sealed-sender guaranteed-once drain (`SEALED_SUBSCRIBE {ack:true}`),
+     * where the broker deletes a replayed `SEALED_MESSAGE` only after this
+     * client confirms {@code {ok:true}} (and dead-letters it on
+     * {@code {ok:false}}).
+     *
+     * <p>Registering again for the same event replaces the previous listener
+     * (same replace semantics as {@link #onEvent} — the two share one
+     * listener slot per event).
+     */
+    public void onEventWithAck(String event, BiConsumer<JSONObject, Ack> handler) {
         Socket s = ensureSocket();
         s.off(event);
         s.on(event, args -> {
-            if (args.length > 0 && args[0] instanceof JSONObject)
-                handler.accept((JSONObject) args[0]);
+            if (args.length == 0 || !(args[0] instanceof JSONObject))
+                return;
+            Ack ack = args[args.length - 1] instanceof Ack
+                    ? (Ack) args[args.length - 1] : null;
+            handler.accept((JSONObject) args[0], ack);
         });
     }
 
