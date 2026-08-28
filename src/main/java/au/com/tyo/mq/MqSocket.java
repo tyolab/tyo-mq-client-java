@@ -269,7 +269,22 @@ public class MqSocket {
 
     public String getId() { return id; }
     public String getName() { return name; }
-    public boolean isConnected() { return connected; }
+
+    /**
+     * True only when BOTH our post-identify readiness flag ({@link #connected},
+     * flipped false by EVENT_DISCONNECT) AND Socket.IO's own authoritative
+     * {@code socket.connected()} agree. Delegating to the library's flag closes
+     * a staleness window: if a transport drop or OS socket teardown doesn't
+     * surface EVENT_DISCONNECT to us, the shadow boolean alone could read a
+     * stale {@code true} — and a caller that early-returns on
+     * {@code isConnected()} would then never reconnect (draining a dead
+     * socket, no live listener). {@code socket.connected()} reflects the real
+     * engine state, so a dead socket now reads false even if our handler
+     * missed the event.
+     */
+    public boolean isConnected() {
+        return connected && socket != null && socket.connected();
+    }
 
     private void handleConsumeChunk(JSONObject chunk) {
         try {
