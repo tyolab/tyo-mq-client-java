@@ -225,12 +225,41 @@ public class MqSocket {
         Socket s = ensureSocket();
         s.off(event);
         s.on(event, args -> {
-            if (args.length == 0 || !(args[0] instanceof JSONObject))
+            if (args.length == 0)
                 return;
+            // The Socket.IO Java parser usually hands a JSON object back as a
+            // JSONObject, but under some server/EIO/transport combinations the
+            // first arg arrives as a JSON String (or the ack slot shifts it).
+            // Coerce those instead of silently dropping the frame — a dropped
+            // SEALED_MESSAGE looks identical to "listener never fired" from the
+            // caller's side and is impossible to diagnose downstream.
+            JSONObject payload = coercePayload(args[0]);
+            if (payload == null) {
+                System.err.println("tyo-mq: dropping '" + event
+                        + "' — first arg is "
+                        + (args[0] == null ? "null" : args[0].getClass().getName())
+                        + ", not a JSON object");
+                return;
+            }
             Ack ack = args[args.length - 1] instanceof Ack
                     ? (Ack) args[args.length - 1] : null;
-            handler.accept((JSONObject) args[0], ack);
+            handler.accept(payload, ack);
         });
+    }
+
+    /** Best-effort: a JSONObject as-is, a JSON String parsed, else null. */
+    private static JSONObject coercePayload(Object arg) {
+        if (arg instanceof JSONObject)
+            return (JSONObject) arg;
+        if (arg instanceof String) {
+            try { return new JSONObject((String) arg); }
+            catch (Exception ignored) { return null; }
+        }
+        if (arg instanceof Map) {
+            try { return new JSONObject((Map<?, ?>) arg); }
+            catch (Exception ignored) { return null; }
+        }
+        return null;
     }
 
     public void disconnect() {
