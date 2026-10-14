@@ -8,11 +8,22 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class Subscriber extends MqSocket {
 
     public Subscriber(String name) {
-        this(name, null, -1, null, null);
+        // Cast disambiguates the String/Supplier token overloads for a bare null.
+        this(name, null, -1, null, (String) null);
     }
 
     public Subscriber(String name, String host, int port, String protocol, String authToken) {
         super(host, port, protocol, authToken);
+        this.type = "CONSUMER";
+        this.name = name != null ? name : Constants.ANONYMOUS;
+    }
+
+    /** Preferred for a long-lived consumer: the supplier is asked for a token on every connect
+     *  attempt, so socket.io's automatic reconnects authenticate with a live one rather than
+     *  whatever was valid when this object was built. */
+    public Subscriber(String name, String host, int port, String protocol,
+                      java.util.function.Supplier<String> authTokenSupplier) {
+        super(host, port, protocol, authTokenSupplier);
         this.type = "CONSUMER";
         this.name = name != null ? name : Constants.ANONYMOUS;
     }

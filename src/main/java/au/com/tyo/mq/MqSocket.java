@@ -18,6 +18,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /**
  * The shared connection layer: Socket.IO v4 transport, the AUTHENTICATION
@@ -29,7 +30,17 @@ public class MqSocket {
     protected final String host;
     protected final int port;
     protected final String protocol;
-    protected final String authToken;
+    /**
+     * Supplies the auth token for EACH connect attempt.
+     *
+     * <p>It is a supplier, not a value, because socket.io reconnects on its own and a broker token
+     * is short-lived (the issuer mints ~15-minute tokens and validates {@code exp} only at CONNECT).
+     * A token captured once at construction is therefore dead for every automatic reconnect after
+     * the first few minutes — the socket comes back up, fails AUTHENTICATION, and is never
+     * identified or re-subscribed. Asking the owner for a token per attempt is what makes
+     * socket.io's own reconnection actually able to succeed.
+     */
+    protected final Supplier<String> authTokenSupplier;
 
     protected String type = "RAW";
     protected String name = Constants.ANONYMOUS;
@@ -54,11 +65,17 @@ public class MqSocket {
         ChunkTransfer(int total, String event) { this.parts = new String[total]; this.event = event; }
     }
 
+    /** Fixed-token form. Fine for a short-lived socket or a non-expiring token; for anything
+     *  long-lived prefer the {@link Supplier} form, so reconnects get a live token. */
     protected MqSocket(String host, int port, String protocol, String authToken) {
+        this(host, port, protocol, () -> authToken);
+    }
+
+    protected MqSocket(String host, int port, String protocol, Supplier<String> authTokenSupplier) {
         this.host = host != null ? host : "localhost";
         this.port = port > 0 ? port : Constants.DEFAULT_PORT;
         this.protocol = protocol != null ? protocol : Constants.DEFAULT_PROTOCOL;
-        this.authToken = authToken;
+        this.authTokenSupplier = authTokenSupplier != null ? authTokenSupplier : () -> null;
     }
 
     /** Creates the underlying Socket.IO socket without opening it, so that
@@ -80,6 +97,7 @@ public class MqSocket {
             connected = false;
             authenticated = false;
             inboundChunks.clear();
+            log("transport disconnected (socket.io will retry)");
         });
         socket.on("CONSUME_CHUNK", args -> handleConsumeChunk((JSONObject) args[0]));
         return socket;
@@ -97,17 +115,44 @@ public class MqSocket {
             throw new IllegalStateException("timed out connecting to " + url());
     }
 
+    /**
+     * Socket.IO is connected — for a FIRST connect or any of its automatic reconnects.
+     *
+     * <p>Note what this deliberately does NOT do: set {@link #connected}. That flag means "session
+     * ready", i.e. authenticated AND identified AND re-subscribed, which is what every caller of
+     * {@link #isConnected()} actually needs to know. Setting it here — as this used to — made a
+     * socket that failed AUTHENTICATION report itself healthy forever: the transport really was up,
+     * so {@code isConnected()} stayed true, and every recovery path that early-returns on it
+     * (re-dial before send, push-wake drain) became a no-op against a socket the broker had never
+     * identified. Messages then queued server-side while the client sat silent until restarted.
+     */
     private void onConnect() {
-        connected = true;
-        if (authToken != null && !authToken.isEmpty()) {
+        String token = authTokenSupplier.get();   // fetched per attempt — see authTokenSupplier
+        log("transport connected; " + (token != null && !token.isEmpty()
+                ? "authenticating" : "no token, identifying directly"));
+        if (token != null && !token.isEmpty()) {
+            // Clear the previous attempt's handlers first. `once` only unregisters itself when it
+            // FIRES, so after N connects that ended in AUTH_OK there were N stale AUTH_FAIL
+            // handlers still waiting — which is why a single failure logged itself repeatedly, and
+            // why the count grew with every reconnect of a long-lived socket.
+            socket.off("AUTH_OK");
+            socket.off("AUTH_FAIL");
             socket.once("AUTH_OK", args -> {
                 authenticated = true;
+                log("AUTH_OK");
                 afterConnect();
             });
-            socket.once("AUTH_FAIL", args ->
-                    System.err.println("tyo-mq authentication failed: "
-                            + (args.length > 0 ? args[0] : "")));
-            emit("AUTHENTICATION", new JSONObject().put("token", authToken));
+            socket.once("AUTH_FAIL", args -> {
+                // Stay NOT-ready: the transport is up but the broker does not know who we are, so
+                // we are deaf. Reporting that honestly is what lets the owner rebuild the socket
+                // (with a freshly minted token) instead of trusting a dead session.
+                connected = false;
+                authenticated = false;
+                // NEVER log the token itself.
+                log("AUTH_FAIL - not identified, not subscribed, session NOT ready: "
+                        + (args.length > 0 ? args[0] : ""));
+            });
+            emit("AUTHENTICATION", new JSONObject().put("token", token));
         } else {
             afterConnect();
         }
@@ -117,7 +162,19 @@ public class MqSocket {
         sendIdentification();
         for (Runnable listener : onConnectListeners)
             listener.run();
+        // Only now is this socket genuinely usable: identified, and every subscription re-sent.
+        connected = true;
         readyLatch.countDown();
+        log("session ready (identified as '" + name + "', "
+                + onConnectListeners.size() + " on-connect listener(s) run)");
+    }
+
+    /** Connection-lifecycle breadcrumb. Deliberately on stderr so this stays platform-neutral
+     *  (it surfaces in logcat under the System.err tag on Android). Never logs the auth token. */
+    private void log(String msg) {
+        // The socket id matters: the owner can build a replacement socket while an older one is
+        // still auto-reconnecting underneath, and without this they are indistinguishable in a log.
+        System.err.println("tyo-mq[" + name + "/" + id.substring(0, 8) + "]: " + msg);
     }
 
     protected void sendIdentification() {
@@ -272,15 +329,27 @@ public class MqSocket {
 
     /**
      * True only when BOTH our post-identify readiness flag ({@link #connected},
-     * flipped false by EVENT_DISCONNECT) AND Socket.IO's own authoritative
-     * {@code socket.connected()} agree. Delegating to the library's flag closes
-     * a staleness window: if a transport drop or OS socket teardown doesn't
-     * surface EVENT_DISCONNECT to us, the shadow boolean alone could read a
-     * stale {@code true} — and a caller that early-returns on
-     * {@code isConnected()} would then never reconnect (draining a dead
-     * socket, no live listener). {@code socket.connected()} reflects the real
-     * engine state, so a dead socket now reads false even if our handler
-     * missed the event.
+     * set in {@code afterConnect} and flipped false by EVENT_DISCONNECT or a
+     * failed AUTHENTICATION) AND Socket.IO's own authoritative
+     * {@code socket.connected()} agree.
+     *
+     * <p>Both halves are load-bearing, and each closes a staleness window that
+     * was a real bug:
+     *
+     * <ul>
+     *   <li>Delegating to the library's flag: if a transport drop or OS socket
+     *       teardown doesn't surface EVENT_DISCONNECT to us, the shadow boolean
+     *       alone could read a stale {@code true}. {@code socket.connected()}
+     *       reflects the real engine state.
+     *   <li>Setting {@link #connected} only after identify: the transport being
+     *       up says nothing about whether the BROKER knows who we are. A socket
+     *       that reconnected and then failed AUTHENTICATION is wide open and
+     *       completely deaf, and reporting it as connected stranded every
+     *       caller that early-returns on this.
+     * </ul>
+     *
+     * <p>A caller may therefore read this as "usable right now": authenticated,
+     * identified, and subscriptions re-sent.
      */
     public boolean isConnected() {
         return connected && socket != null && socket.connected();
