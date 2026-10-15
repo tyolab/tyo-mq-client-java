@@ -181,8 +181,21 @@ public class MqSocket {
         emit(type, new JSONObject().put("name", name).put("id", id).put("consumer_id", name));
     }
 
-    /** Runs on every (re)connect — used by Subscriber to re-subscribe. */
-    protected void addOnConnectListener(Runnable listener) {
+    /**
+     * Run {@code listener} on every (re)connect, after this socket has re-identified.
+     *
+     * <p>Used by {@link Subscriber} to re-send its subscriptions, and public because an owner often
+     * has its own per-connection registration to repeat. "On connect" must mean every connect: a
+     * TRANSPORT-level reconnect (broker restart, network blip, ping timeout) re-identifies the
+     * consumer without the owner's connect path running at all, so anything hung only off that path
+     * is silently skipped — which is how a secure-chat UAK registration went missing after a broker
+     * restart while the consumer looked perfectly re-registered.
+     *
+     * <p><b>Runs on the socket thread.</b> Do not block in here, and in particular do not call
+     * {@link #emitWithAck}: the ack you would wait for arrives on the very thread you are holding.
+     * Hand the work to your own executor.
+     */
+    public void addOnConnectListener(Runnable listener) {
         onConnectListeners.add(listener);
     }
 
