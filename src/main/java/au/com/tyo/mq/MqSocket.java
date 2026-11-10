@@ -245,6 +245,33 @@ public class MqSocket {
     }
 
     /**
+     * Emit with the broker's acknowledgement delivered to {@code onAck} — WITHOUT blocking.
+     *
+     * <p>The non-blocking sibling of {@link #emitWithAck}. That one parks the caller until the ack
+     * or a timeout, which is wrong for anything a user triggers: an Android app that unsubscribes
+     * when the user taps a button is on the main thread, and a slow broker would freeze the app.
+     * Here the call returns at once and the reply arrives later.
+     *
+     * <p>{@code onAck} runs on the socket thread, receives the ack's first argument as a
+     * {@link JSONObject} (null if the broker acked with nothing, or with a non-object), and must
+     * stay trivial — log, set a flag. Never block in it, and never call {@link #emitWithAck} from
+     * it: that ack would have to arrive on the very thread you are holding. If the broker never
+     * acks (an older broker, or a dropped socket), {@code onAck} is simply never called.
+     */
+    public void emitWithCallback(String event, JSONObject payload,
+                                 java.util.function.Consumer<JSONObject> onAck) {
+        ensureSocket().emit(event, new Object[]{payload}, args -> {
+            JSONObject reply = (args.length > 0 && args[0] instanceof JSONObject)
+                    ? (JSONObject) args[0] : null;
+            try {
+                onAck.accept(reply);
+            } catch (Exception e) {
+                System.err.println("ack handler for " + event + " failed: " + e);
+            }
+        });
+    }
+
+    /**
      * Emit {@code event} with {@code payload} and block until the server's
      * Socket.IO acknowledgement callback fires, returning its first argument as
      * a {@link JSONObject} (the broker replies via {@code callback({...})}).

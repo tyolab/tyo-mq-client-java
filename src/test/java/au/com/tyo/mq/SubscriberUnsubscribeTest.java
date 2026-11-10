@@ -35,6 +35,21 @@ public class SubscriberUnsubscribeTest {
             payloads.add(payload);
         }
 
+        /** The ack the next emitWithCallback should receive; null means "never acked". */
+        JSONObject cannedAck;
+        boolean ackInvoked;
+
+        @Override
+        public void emitWithCallback(String event, JSONObject payload,
+                                     java.util.function.Consumer<JSONObject> onAck) {
+            events.add(event);
+            payloads.add(payload);
+            if (cannedAck != null) {
+                ackInvoked = true;
+                onAck.accept(cannedAck);
+            }
+        }
+
         void setConnected(boolean c) {
             connected = c;
         }
@@ -165,5 +180,33 @@ public class SubscriberUnsubscribeTest {
         int n = 0;
         for (String y : xs) if (x.equals(y)) n++;
         return n;
+    }
+
+    /** A broker ack is consumed, success and refusal alike, without throwing. */
+    @Test
+    public void theBrokersAckIsHandledEitherWay() {
+        Recording s = new Recording();
+        s.subscribe(Constants.ALL_PRODUCERS, "hilia-link-x-up", (m, f, a, o) -> { });
+        s.setConnected(true);
+        s.cannedAck = new JSONObject().put("ok", true).put("removed", 1);
+        s.unsubscribe(Constants.ALL_PRODUCERS, "hilia-link-x-up");
+        assertTrue(s.ackInvoked);
+
+        Recording r = new Recording();
+        r.setConnected(true);
+        r.cannedAck = new JSONObject().put("ok", false).put("reason", "not_subscribed");
+        r.unsubscribe(Constants.ALL_PRODUCERS, "never-held");
+        assertTrue("a refusal is reported, not thrown", r.ackInvoked);
+    }
+
+    /** UNSUBSCRIBE goes through the non-blocking path, never a plain fire-and-forget emit. */
+    @Test
+    public void unsubscribeAsksForAnAck() {
+        Recording s = new Recording();
+        s.setConnected(true);
+        s.cannedAck = new JSONObject().put("ok", true).put("removed", 1);
+        s.unsubscribe(Constants.ALL_PRODUCERS, "hilia-link-x-up");
+        assertTrue("the outcome must be observable, which is the point of the 1.5.0 ack",
+                s.ackInvoked);
     }
 }

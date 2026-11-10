@@ -151,15 +151,41 @@ public class Subscriber extends MqSocket {
             payload.put("mode", "topic");
 
         if (connected) {
-            emit("UNSUBSCRIBE", payload);
+            sendUnsubscribe(event, payload);
             return;
         }
         Runnable[] once = new Runnable[1];
         once[0] = () -> {
             removeOnConnectListener(once[0]);
-            emit("UNSUBSCRIBE", payload);
+            sendUnsubscribe(event, payload);
         };
         addOnConnectListener(once[0]);
+    }
+
+    /**
+     * Send UNSUBSCRIBE and LOG what the broker says about it.
+     *
+     * <p>Logged because silence is what hid the original bug: for every named consumer the broker
+     * used to delete nothing and say nothing, and the client could not tell. Since tyo-mq 1.5.0 it
+     * acks {@code {ok:true, removed, event}} or {@code {ok:false, reason}}. A
+     * {@code not_subscribed} for a topic this client believed it held is a disagreement between the
+     * two sides' views of the world, so it is called out as such. Non-blocking: see
+     * {@link #emitWithCallback}.
+     */
+    private void sendUnsubscribe(String event, JSONObject payload) {
+        emitWithCallback("UNSUBSCRIBE", payload, reply -> {
+            if (reply == null) {
+                System.err.println("UNSUBSCRIBE " + event + ": broker acked with no body");
+            } else if (reply.optBoolean("ok", false)) {
+                System.err.println("UNSUBSCRIBE " + event + ": removed "
+                        + reply.optInt("removed", 0));
+            } else {
+                System.err.println("UNSUBSCRIBE " + event + ": broker REFUSED ("
+                        + reply.optString("reason", "no reason") + ")"
+                        + ("not_subscribed".equals(reply.optString("reason"))
+                        ? " — it did not hold a subscription this client believed it had" : ""));
+            }
+        });
     }
 
     /** Undo {@link #subscribeTopic(String, SubscribeOptions, ConsumeHandler)}. */
