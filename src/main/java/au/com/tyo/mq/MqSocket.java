@@ -199,6 +199,37 @@ public class MqSocket {
         onConnectListeners.add(listener);
     }
 
+    /** Remove a listener added by {@link #addOnConnectListener}. Safe when it is not present. */
+    public void removeOnConnectListener(Runnable listener) {
+        onConnectListeners.remove(listener);
+    }
+
+    /** How many on-connect listeners are registered. For tests: a subscription that cannot be
+     *  undone shows up here as a count that only ever grows. */
+    int onConnectListenerCount() {
+        return onConnectListeners.size();
+    }
+
+    /** Whether a local handler is registered for {@code event}. For tests. */
+    boolean hasLocalHandler(String event) {
+        return localHandlers.containsKey(event);
+    }
+
+    /**
+     * Stop dispatching {@code event} locally — the inverse of {@link #on}.
+     *
+     * <p>Removes it from {@code localHandlers} as well as the live socket, because chunked
+     * deliveries are dispatched from that map rather than through the socket's own listeners: a
+     * socket-only {@code off} would leave large frames still reaching a handler that was meant to
+     * be gone.
+     */
+    protected void off(String event) {
+        localHandlers.remove(event);
+        Socket s = socket;
+        if (s != null)
+            s.off(event);
+    }
+
     protected void on(String event, Consumer<JSONObject> handler) {
         localHandlers.put(event, handler);
         Socket s = ensureSocket();

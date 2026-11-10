@@ -29,7 +29,7 @@ public class MqSocketAckTest {
 
     @Test
     public void emitWithAckThrowsTimeoutWhenNoAckArrives() throws Exception {
-        Subscriber sock = new Subscriber("ack-test", "127.0.0.1", DEAD_PORT, "http", null);
+        Subscriber sock = new Subscriber("ack-test", "127.0.0.1", DEAD_PORT, "http", (String) null);
         long start = System.currentTimeMillis();
         try {
             sock.emitWithAck("PREKEY_TAKE", new JSONObject().put("identity", "nobody"), 250);

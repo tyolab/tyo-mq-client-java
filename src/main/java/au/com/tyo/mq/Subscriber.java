@@ -2,10 +2,22 @@ package au.com.tyo.mq;
 
 import org.json.JSONObject;
 
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /** A tyo-mq consumer. */
 public class Subscriber extends MqSocket {
+
+    /**
+     * The on-connect re-send for each live subscription, keyed by its consume event.
+     *
+     * <p>Kept so a subscription can be undone. Without it the runnable that re-SUBSCRIBEs after
+     * every reconnect could never be removed, so {@link #unsubscribe} would last only until the
+     * next network blip — after which the client would quietly subscribe again to a topic the
+     * caller had finished with.
+     */
+    private final Map<String, Runnable> resubscribers = new ConcurrentHashMap<>();
 
     public Subscriber(String name) {
         // Cast disambiguates the String/Supplier token overloads for a bare null.
@@ -80,7 +92,79 @@ public class Subscriber extends MqSocket {
         Runnable send = () -> emit("SUBSCRIBE", payload);
         if (connected)
             send.run();
+        // Replace rather than accumulate: subscribing twice to the same consume event used to add
+        // a second re-send runnable each time, so every reconnect re-SUBSCRIBEd N times.
+        Runnable previous = resubscribers.put(consumeEvent, send);
+        if (previous != null)
+            removeOnConnectListener(previous);
         addOnConnectListener(send);
+    }
+
+    /** Undo {@link #subscribe(String, String, ConsumeHandler)}. */
+    public void unsubscribe(String producer, String event) {
+        unsubscribe(producer, event, new SubscribeOptions());
+    }
+
+    /**
+     * Undo a {@link #subscribe(String, String, SubscribeOptions, ConsumeHandler)} — all of it.
+     *
+     * <p>{@code subscribe} sets up three things, and leaving any one behind defeats the rest:
+     * <ol>
+     *   <li>the local handler — removed, so nothing more is dispatched to the caller;</li>
+     *   <li>the on-connect re-send — removed, or the next reconnect re-SUBSCRIBEs a topic the
+     *       caller has finished with, whatever the broker did;</li>
+     *   <li>the broker's subscription — an UNSUBSCRIBE carrying the SAME object SUBSCRIBE sent, so
+     *       the broker derives the subscription key exactly as it did when storing it, instead of
+     *       every client having to replicate the broker's internal event encoding.</li>
+     * </ol>
+     *
+     * <p>When not connected the UNSUBSCRIBE is deferred to the next connect, as a one-shot
+     * listener. That ordering matters: on-connect listeners run after identification, and
+     * identification is where the broker RESTORES a named consumer's subscriptions — so an
+     * UNSUBSCRIBE sent any earlier would be undone by the restore it preceded.
+     *
+     * <p>Fire-and-forget: the broker's UNSUBSCRIBE gives no ack today. Note also that as deployed
+     * (tyo-mq {@code d7e87be}) it deletes by socket id while SUBSCRIBE stores by consumer name, so
+     * for a named consumer the broker half is currently a no-op; raised with the tyo-mq lane. The
+     * client half is correct regardless and is what stops the re-send.
+     */
+    public void unsubscribe(String producer, String event, SubscribeOptions options) {
+        if ("topic".equals(options.mode) && producer == null)
+            producer = Constants.ALL_PRODUCERS;
+        final String who = producer;
+
+        String consumerEvent = Events.toConsumerEvent(event, who, false);
+        String consumeEvent = Events.toConsumeEvent(consumerEvent);
+
+        off(consumeEvent);
+        Runnable send = resubscribers.remove(consumeEvent);
+        if (send != null)
+            removeOnConnectListener(send);
+
+        JSONObject payload = new JSONObject();
+        payload.put("event", event);
+        payload.put("producer", who);
+        payload.put("consumer", name);
+        payload.put("scope", Constants.SCOPE_DEFAULT);
+        payload.put("consumer_id", name);
+        if ("topic".equals(options.mode))
+            payload.put("mode", "topic");
+
+        if (connected) {
+            emit("UNSUBSCRIBE", payload);
+            return;
+        }
+        Runnable[] once = new Runnable[1];
+        once[0] = () -> {
+            removeOnConnectListener(once[0]);
+            emit("UNSUBSCRIBE", payload);
+        };
+        addOnConnectListener(once[0]);
+    }
+
+    /** Undo {@link #subscribeTopic(String, SubscribeOptions, ConsumeHandler)}. */
+    public void unsubscribeTopic(String pattern) {
+        unsubscribe(Constants.ALL_PRODUCERS, pattern, new SubscribeOptions().topic());
     }
 
     /**
